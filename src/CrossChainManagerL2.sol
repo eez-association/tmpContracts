@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {CrossChainProxy} from "./CrossChainProxy.sol";
+import {
+    ActionType,
+    Action,
+    ExecutionEntry,
+    ProxyInfo
+} from "./Rollups.sol";
+
+/// @title CrossChainManagerL2
+/// @notice L2-side contract for cross-chain execution via pre-computed execution tables
+/// @dev No rollups, no state deltas, no ZK proofs. System address loads execution tables,
+///      which are consumed via proxy calls (executeL2Call) or system executeRemoteCall.
+contract CrossChainManagerL2 {
+    /// @notice The rollup ID this L2 belongs to
+    uint256 public immutable ROLLUP_ID;
+
+    /// @notice The system address authorized for admin operations
+    address public immutable SYSTEM_ADDRESS;
+
+    /// @notice Mapping from action hash to pre-computed executions
+    mapping(bytes32 actionHash => ExecutionEntry[] executions) internal _executions;
+
+    /// @notice Mapping of authorized CrossChainProxy contracts to their identity
+    mapping(address proxy => ProxyInfo info) public authorizedProxies;
+
+    error Unauthorized();
+    error UnauthorizedProxy();
+    error ExecutionNotFound();
+    error CallExecutionFailed();
+    error ScopeReverted(bytes nextAction);
+
+    event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint256 indexed originalRollupId);
+
+    constructor(uint256 _rollupId, address _systemAddress) {
+        ROLLUP_ID = _rollupId;
+        SYSTEM_ADDRESS = _systemAddress;
+    }
+
+    modifier onlySystemAddress() {
+        if (msg.sender != SYSTEM_ADDRESS) revert Unauthorized();
+        _;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Admin: load execution table
+    // ──────────────────────────────────────────────
+
+    /// @notice Loads execution entries into the execution table (system only)
+    /// @param entries The execution entries to load
+    function loadExecutionTable(ExecutionEntry[] calldata entries) external onlySystemAddress {
+        for (uint256 i = 0; i < entries.length; i++) {
+            _executions[entries[i].actionHash].push(entries[i]);
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    //  Execution entry points
+    // ──────────────────────────────────────────────
+
+    /// @notice Executes a cross-chain call initiated by an authorized proxy
+    /// @param sourceAddress The original caller address (msg.sender as seen by the proxy)
+    /// @param callData The original calldata sent to the proxy
+    /// @return result The return data from the execution
+    function executeCrossChainCall(address sourceAddress, bytes calldata callData) external payable returns (bytes memory result) {
+        ProxyInfo storage proxyInfo = authorizedProxies[msg.sender];
+        if (proxyInfo.originalAddress == address(0)) revert UnauthorizedProxy();
+
+        Action memory action = Action({
+            actionType: ActionType.CALL,
+            rollupId: proxyInfo.originalRollupId,
+            destination: proxyInfo.originalAddress,
+            value: msg.value,
+            data: callData,
+            failed: false,
+            sourceAddress: sourceAddress,
+            sourceRollup: 0,
+            scope: new uint256[](0)
+        });
+
+        bytes32 actionHash = keccak256(abi.encode(action));
+        Action memory nextAction = _consumeExecution(actionHash);
+        return _resolveScopes(nextAction);
+    }
+
+    /// @notice Executes a remote cross-chain call (system only)
+    /// @dev The rollupId is always this contract's rollupId
+    /// @param destination The destination address
+    /// @param value The ETH value to send
+    /// @param data The calldata for the call
+    /// @param sourceAddress The original caller address on the source chain
+    /// @param sourceRollup The source rollup ID
+    /// @param scope The scope for nested call navigation
+    /// @return result The return data from the execution
+    function executeRemoteCall( 
+        address destination,
+        uint256 value,
+        bytes calldata data,
+        address sourceAddress,
+        uint256 sourceRollup,
+        uint256[] calldata scope
+    ) external onlySystemAddress returns (bytes memory result) {
+        Action memory action = Action({
+            actionType: ActionType.CALL,
+            rollupId: ROLLUP_ID,
+            destination: destination,
+            value: value,
+            data: data,
+            failed: false,
+            sourceAddress: sourceAddress,
+            sourceRollup: sourceRollup,
+            scope: scope
+        });
+
+        uint256[] memory emptyScope = new uint256[](0);
+        Action memory nextAction;
+        try this.newScope(emptyScope, action) returns (Action memory retAction) {
+            nextAction = retAction;
+        } catch (bytes memory revertData) {
+            nextAction = _handleScopeRevert(revertData);
+        }
+
+        if (nextAction.actionType != ActionType.RESULT || nextAction.failed) {
+            revert CallExecutionFailed();
+        }
+        return nextAction.data;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Scope navigation
+    // ──────────────────────────────────────────────
+
+    function newScope(
+        uint256[] memory scope,
+        Action memory action
+    ) external returns (Action memory nextAction) {
+        if (msg.sender != address(this) && authorizedProxies[msg.sender].originalAddress == address(0)) {
+            revert UnauthorizedProxy();
+        }
+
+        nextAction = action;
+
+        while (true) {
+            if (nextAction.actionType == ActionType.CALL) {
+                if (_isChildScope(scope, nextAction.scope)) {
+                    uint256[] memory newScopeArr = _appendToScope(scope, nextAction.scope[scope.length]);
+                    try this.newScope(newScopeArr, nextAction) returns (Action memory retAction) {
+                        nextAction = retAction;
+                    } catch (bytes memory revertData) {
+                        nextAction = _handleScopeRevert(revertData);
+                    }
+                } else if (_scopesMatch(scope, nextAction.scope)) {
+                    (, nextAction) = _processCallAtScope(scope, nextAction);
+                } else {
+                    break;
+                }
+            } else if (nextAction.actionType == ActionType.REVERT) {
+                if (_scopesMatch(scope, nextAction.scope)) {
+                    Action memory continuation = _getRevertContinuation(nextAction.rollupId);
+                    revert ScopeReverted(abi.encode(continuation));
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        return nextAction;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Proxy creation
+    // ──────────────────────────────────────────────
+
+    function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy) {
+        return _createProxyInternal(originalAddress, originalRollupId);
+    }
+
+    // ──────────────────────────────────────────────
+    //  Internal helpers
+    // ──────────────────────────────────────────────
+
+    function _createProxyInternal(address originalAddress, uint256 originalRollupId) internal returns (address proxy) {
+        bytes32 salt = keccak256(abi.encodePacked(block.chainid, originalRollupId, originalAddress));
+        proxy = address(new CrossChainProxy{salt: salt}(address(this), originalAddress, originalRollupId));
+        authorizedProxies[proxy] = ProxyInfo(originalAddress, uint64(originalRollupId));
+        emit CrossChainProxyCreated(proxy, originalAddress, originalRollupId);
+    }
+
+    /// @notice Consumes the last execution entry for the given action hash
+    function _consumeExecution(bytes32 actionHash) internal returns (Action memory nextAction) {
+        ExecutionEntry[] storage executions = _executions[actionHash];
+        if (executions.length == 0) revert ExecutionNotFound();
+
+        uint256 lastIndex = executions.length - 1;
+        nextAction = executions[lastIndex].nextAction;
+        executions.pop();
+
+        return nextAction;
+    }
+
+    function _resolveScopes(Action memory nextAction) internal returns (bytes memory result) {
+        if (nextAction.actionType == ActionType.CALL) {
+            uint256[] memory emptyScope = new uint256[](0);
+            try this.newScope(emptyScope, nextAction) returns (Action memory retAction) {
+                nextAction = retAction;
+            } catch (bytes memory revertData) {
+                nextAction = _handleScopeRevert(revertData);
+            }
+        }
+
+        if (nextAction.actionType != ActionType.RESULT || nextAction.failed) {
+            revert CallExecutionFailed();
+        }
+        return nextAction.data;
+    }
+
+    function _processCallAtScope(
+        uint256[] memory currentScope,
+        Action memory action
+    ) internal returns (uint256[] memory scope, Action memory nextAction) {
+        address sourceProxy = this.computeCrossChainProxyAddress(
+            action.sourceAddress,
+            action.sourceRollup,
+            block.chainid
+        );
+
+        if (authorizedProxies[sourceProxy].originalAddress == address(0)) {
+            _createProxyInternal(action.sourceAddress, action.sourceRollup);
+        }
+
+        (bool success, bytes memory returnData) = address(sourceProxy).call{value: action.value}(
+            abi.encodeCall(CrossChainProxy.executeOnBehalf, (action.destination, action.data))
+        );
+
+        Action memory resultAction = Action({
+            actionType: ActionType.RESULT,
+            rollupId: action.rollupId,
+            destination: address(0),
+            value: 0,
+            data: returnData,
+            failed: !success,
+            sourceAddress: address(0),
+            sourceRollup: 0,
+            scope: new uint256[](0)
+        });
+
+        bytes32 resultHash = keccak256(abi.encode(resultAction));
+        nextAction = _consumeExecution(resultHash);
+
+        return (currentScope, nextAction);
+    }
+
+    function _handleScopeRevert(bytes memory revertData) internal pure returns (Action memory nextAction) {
+        require(revertData.length > 4, "Invalid revert data");
+        bytes memory withoutSelector = new bytes(revertData.length - 4);
+        for (uint256 i = 4; i < revertData.length; i++) {
+            withoutSelector[i - 4] = revertData[i];
+        }
+        (bytes memory actionBytes) = abi.decode(withoutSelector, (bytes));
+        return abi.decode(actionBytes, (Action));
+    }
+
+    function _getRevertContinuation(uint256 rollupId) internal returns (Action memory nextAction) {
+        Action memory revertContinueAction = Action({
+            actionType: ActionType.REVERT_CONTINUE,
+            rollupId: rollupId,
+            destination: address(0),
+            value: 0,
+            data: "",
+            failed: true,
+            sourceAddress: address(0),
+            sourceRollup: 0,
+            scope: new uint256[](0)
+        });
+
+        bytes32 revertHash = keccak256(abi.encode(revertContinueAction));
+        return _consumeExecution(revertHash);
+    }
+
+    function _appendToScope(uint256[] memory scope, uint256 element) internal pure returns (uint256[] memory) {
+        uint256[] memory result = new uint256[](scope.length + 1);
+        for (uint256 i = 0; i < scope.length; i++) {
+            result[i] = scope[i];
+        }
+        result[scope.length] = element;
+        return result;
+    }
+
+    function _scopesMatch(uint256[] memory a, uint256[] memory b) internal pure returns (bool) {
+        if (a.length != b.length) return false;
+        for (uint256 i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
+    function _isChildScope(uint256[] memory currentScope, uint256[] memory targetScope) internal pure returns (bool) {
+        if (targetScope.length <= currentScope.length) return false;
+        for (uint256 i = 0; i < currentScope.length; i++) {
+            if (currentScope[i] != targetScope[i]) return false;
+        }
+        return true;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Views
+    // ──────────────────────────────────────────────
+
+    function computeCrossChainProxyAddress(
+        address originalAddress,
+        uint256 originalRollupId,
+        uint256 domain
+    ) external view returns (address) {
+        bytes32 salt = keccak256(abi.encodePacked(domain, originalRollupId, originalAddress));
+        bytes32 bytecodeHash = keccak256(
+            abi.encodePacked(
+                type(CrossChainProxy).creationCode,
+                abi.encode(address(this), originalAddress, originalRollupId)
+            )
+        );
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, bytecodeHash)))));
+    }
+}
